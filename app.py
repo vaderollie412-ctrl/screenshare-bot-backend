@@ -1,11 +1,14 @@
 """
-Screenshare Bot - Backend API (with debug endpoint)
+Screenshare Bot - Backend API
+screensharing.net uses WebRTC which requires a real display.
+We use a virtual display (Xvfb) + Chrome in normal mode to work around this.
 """
 import os
 import time
 import uuid
 import logging
 import threading
+import subprocess
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from selenium import webdriver
@@ -24,10 +27,24 @@ CORS(app)
 jobs = {}
 jobs_lock = threading.Lock()
 
+# Start virtual display once at startup
+DISPLAY = ":99"
+def start_xvfb():
+    try:
+        subprocess.Popen(
+            ["Xvfb", DISPLAY, "-screen", "0", "1280x900x24", "-ac"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        time.sleep(2)
+        log.info("Xvfb virtual display started on " + DISPLAY)
+    except Exception as e:
+        log.warning(f"Xvfb not available: {e} — falling back to headless")
 
-def get_chrome_options():
+start_xvfb()
+
+
+def make_driver():
     options = Options()
-    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -35,77 +52,27 @@ def get_chrome_options():
     options.add_argument("--window-size=1280,900")
     options.add_argument("--use-fake-ui-for-media-stream")
     options.add_argument("--use-fake-device-for-media-stream")
+    options.add_argument("--auto-select-desktop-capture-source=Entire screen")
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-extensions")
     options.add_argument("--remote-debugging-port=0")
     options.binary_location = "/opt/chrome-linux64/chrome"
-    return options
 
+    # Use virtual display if available, otherwise headless
+    if os.path.exists("/tmp/.X99-lock") or os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = DISPLAY
+        log.info("Using virtual display")
+    else:
+        options.add_argument("--headless=new")
+        log.info("Using headless mode")
 
-def make_driver():
-    options = get_chrome_options()
     chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
     service = Service(chromedriver_path)
     return webdriver.Chrome(service=service, options=options)
 
 
-# ── DEBUG ENDPOINT ────────────────────────────────────────────────────────────
-@app.route("/api/debug", methods=["GET"])
-def debug():
-    """Visit screensharing.net and dump all buttons, inputs, links so we can fix selectors."""
-    driver = None
-    try:
-        driver = make_driver()
-        driver.get("https://screensharing.net")
-        time.sleep(4)
-
-        result = {
-            "url": driver.current_url,
-            "title": driver.title,
-            "buttons": [],
-            "inputs": [],
-            "links": [],
-            "page_source_snippet": driver.page_source[:5000],
-        }
-
-        for el in driver.find_elements(By.TAG_NAME, "button"):
-            result["buttons"].append({
-                "text": el.text.strip(),
-                "id": el.get_attribute("id"),
-                "class": el.get_attribute("class"),
-                "visible": el.is_displayed(),
-            })
-
-        for el in driver.find_elements(By.TAG_NAME, "input"):
-            result["inputs"].append({
-                "type": el.get_attribute("type"),
-                "id": el.get_attribute("id"),
-                "name": el.get_attribute("name"),
-                "placeholder": el.get_attribute("placeholder"),
-                "value": el.get_attribute("value"),
-                "class": el.get_attribute("class"),
-            })
-
-        for el in driver.find_elements(By.TAG_NAME, "a"):
-            href = el.get_attribute("href") or ""
-            if href:
-                result["links"].append({"text": el.text.strip(), "href": href})
-
-        return jsonify(result)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-
-
-# ── SCREENSHARE JOB ───────────────────────────────────────────────────────────
 def run_screenshare_job(job_id, url):
-    log.info(f"[{job_id}] Starting job for URL: {url}")
+    log.info(f"[{job_id}] Starting job for: {url}")
     with jobs_lock:
         jobs[job_id]["status"] = "running"
 
@@ -113,70 +80,68 @@ def run_screenshare_job(job_id, url):
     try:
         driver = make_driver()
         log.info(f"[{job_id}] Chrome started")
-        wait = WebDriverWait(driver, 20)
 
-        log.info(f"[{job_id}] Opening target URL: {url}")
+        # Step 1: Open target URL in tab 1
         driver.get(url)
         time.sleep(2)
         target_tab = driver.current_window_handle
+        log.info(f"[{job_id}] Target URL loaded")
 
-        log.info(f"[{job_id}] Opening screensharing.net")
+        # Step 2: Open screensharing.net in tab 2
         driver.execute_script("window.open('https://screensharing.net', '_blank');")
         time.sleep(2)
         tabs = driver.window_handles
         screenshare_tab = [t for t in tabs if t != target_tab][0]
         driver.switch_to.window(screenshare_tab)
         time.sleep(4)
-        log.info(f"[{job_id}] Page title: {driver.title}, URL: {driver.current_url}")
+        log.info(f"[{job_id}] screensharing.net loaded: {driver.title}")
 
-        log.info(f"[{job_id}] Looking for Share Screen button")
-        clicked = False
-        selectors = [
-            (By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'share screen')]"),
-            (By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'share')]"),
-            (By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'start')]"),
-            (By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'screen')]"),
-            (By.XPATH, "//*[@id='share' or @id='start' or @id='shareBtn' or @id='startBtn']"),
-            (By.XPATH, "//button"),
-        ]
-        for by, selector in selectors:
-            try:
-                els = driver.find_elements(by, selector)
-                for el in els:
-                    if el.is_displayed():
-                        log.info(f"[{job_id}] Clicking: '{el.text}' id={el.get_attribute('id')}")
-                        el.click()
-                        clicked = True
-                        break
-            except Exception:
-                pass
-            if clicked:
-                break
-
-        if not clicked:
-            log.warning(f"[{job_id}] No button found - dumping all buttons:")
+        # Step 3: Click SHARE MY SCREEN
+        wait = WebDriverWait(driver, 15)
+        try:
+            btn = wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//button[contains(text(),'SHARE MY SCREEN') or contains(text(),'Share My Screen') or contains(text(),'share my screen')]")
+            ))
+            log.info(f"[{job_id}] Found button: '{btn.text}'")
+            btn.click()
+            log.info(f"[{job_id}] Clicked share button")
+        except Exception as e:
+            log.warning(f"[{job_id}] Primary button not found ({e}), trying fallback")
+            # Fallback: click first visible button
             for el in driver.find_elements(By.TAG_NAME, "button"):
-                log.info(f"  button text='{el.text}' id={el.get_attribute('id')} class={el.get_attribute('class')}")
+                if el.is_displayed() and el.text.strip():
+                    log.info(f"[{job_id}] Fallback click: '{el.text}'")
+                    el.click()
+                    break
 
-        time.sleep(4)
+        time.sleep(5)
 
-        log.info(f"[{job_id}] Waiting for share link...")
+        # Step 4: Handle screen picker dialog if it appears
+        # screensharing.net redirects to a room URL after sharing starts
+        log.info(f"[{job_id}] Waiting for room URL...")
         share_link = None
-        for attempt in range(25):
-            current = driver.current_url
-            log.info(f"[{job_id}] Attempt {attempt+1} URL: {current}")
 
+        for attempt in range(30):
+            current = driver.current_url
+            log.info(f"[{job_id}] Attempt {attempt+1}: {current}")
+
+            # Room URL looks like screensharing.net/room/xxxx or screensharing.net/s/xxxx
             if "screensharing.net" in current and current not in (
-                "https://screensharing.net", "https://screensharing.net/", "about:blank"
-            ):
+                "https://screensharing.net",
+                "https://screensharing.net/",
+                "about:blank"
+            ) and len(current) > 30:
                 share_link = current
+                log.info(f"[{job_id}] Got room URL: {share_link}")
                 break
 
+            # Check for any input/element showing a shareable link
             try:
                 for el in driver.find_elements(By.TAG_NAME, "input"):
                     val = el.get_attribute("value") or ""
-                    if val.startswith("http"):
+                    if "screensharing.net" in val and len(val) > 25:
                         share_link = val.strip()
+                        log.info(f"[{job_id}] Got link from input: {share_link}")
                         break
             except Exception:
                 pass
@@ -186,8 +151,22 @@ def run_screenshare_job(job_id, url):
             try:
                 for el in driver.find_elements(By.XPATH, "//*[contains(text(),'screensharing.net/')]"):
                     txt = el.text.strip()
-                    if txt.startswith("http"):
+                    if txt.startswith("http") and len(txt) > 25:
                         share_link = txt
+                        log.info(f"[{job_id}] Got link from text: {share_link}")
+                        break
+            except Exception:
+                pass
+            if share_link:
+                break
+
+            # Check all clickable elements for copy/link buttons
+            try:
+                for el in driver.find_elements(By.XPATH, "//*[contains(@class,'copy') or contains(@id,'copy') or contains(@class,'share-link')]"):
+                    val = el.get_attribute("data-clipboard-text") or el.get_attribute("value") or el.text or ""
+                    if "screensharing.net" in val:
+                        share_link = val.strip()
+                        log.info(f"[{job_id}] Got link from copy element: {share_link}")
                         break
             except Exception:
                 pass
@@ -197,16 +176,18 @@ def run_screenshare_job(job_id, url):
             time.sleep(1)
 
         if share_link:
-            log.info(f"[{job_id}] Done! Link: {share_link}")
             with jobs_lock:
                 jobs[job_id]["status"] = "done"
                 jobs[job_id]["share_link"] = share_link
         else:
+            # Dump final page state for debugging
             try:
-                log.info(f"[{job_id}] PAGE SOURCE: {driver.page_source[:3000]}")
+                log.info(f"[{job_id}] Final URL: {driver.current_url}")
+                log.info(f"[{job_id}] Final title: {driver.title}")
+                log.info(f"[{job_id}] Page source: {driver.page_source[:2000]}")
             except Exception:
                 pass
-            msg = "Could not detect share link. Open /api/debug in browser for page structure."
+            msg = "Screen shared but could not get link — screensharing.net may require manual tab selection. Try the /api/debug endpoint."
             log.error(f"[{job_id}] {msg}")
             with jobs_lock:
                 jobs[job_id]["status"] = "error"
@@ -221,8 +202,32 @@ def run_screenshare_job(job_id, url):
         if driver:
             try:
                 driver.quit()
+                log.info(f"[{job_id}] Chrome closed")
             except Exception:
                 pass
+
+
+@app.route("/api/debug", methods=["GET"])
+def debug():
+    driver = None
+    try:
+        driver = make_driver()
+        driver.get("https://screensharing.net")
+        time.sleep(4)
+        result = {
+            "url": driver.current_url,
+            "title": driver.title,
+            "buttons": [{"text": el.text.strip(), "id": el.get_attribute("id"), "class": el.get_attribute("class"), "visible": el.is_displayed()} for el in driver.find_elements(By.TAG_NAME, "button")],
+            "inputs": [{"type": el.get_attribute("type"), "id": el.get_attribute("id"), "placeholder": el.get_attribute("placeholder"), "value": el.get_attribute("value")} for el in driver.find_elements(By.TAG_NAME, "input")],
+            "page_source_snippet": driver.page_source[:5000],
+        }
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if driver:
+            try: driver.quit()
+            except Exception: pass
 
 
 @app.route("/api/health", methods=["GET"])
@@ -238,13 +243,10 @@ def start_screenshare():
         return jsonify({"error": "Missing URL"}), 400
     if not url.startswith("http"):
         url = "https://" + url
-
     job_id = str(uuid.uuid4())
     with jobs_lock:
         jobs[job_id] = {"status": "queued", "url": url, "share_link": None, "error": None}
-
-    thread = threading.Thread(target=run_screenshare_job, args=(job_id, url), daemon=True)
-    thread.start()
+    threading.Thread(target=run_screenshare_job, args=(job_id, url), daemon=True).start()
     log.info(f"Job {job_id} queued for {url}")
     return jsonify({"job_id": job_id})
 

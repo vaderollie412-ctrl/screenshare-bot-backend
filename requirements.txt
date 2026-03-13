@@ -3,3 +3,4 @@ flask-cors==4.0.1
 selenium==4.18.1
 webdriver-manager==4.0.1
 gunicorn==22.0.0
+# v2

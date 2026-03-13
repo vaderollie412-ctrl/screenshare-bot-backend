@@ -1,5 +1,5 @@
 FROM python:3.12-slim
-
+# rebuild
 # Install dependencies + Xvfb
 RUN apt-get update && apt-get install -y \
     wget curl unzip gnupg xvfb \

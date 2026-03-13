@@ -56,10 +56,13 @@ def make_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,900")
     options.add_argument("--use-fake-ui-for-media-stream")
-    options.add_argument("--use-fake-device-for-media-stream")
+    # No --use-fake-device so Xvfb real display content is captured
     options.add_argument("--auto-select-desktop-capture-source=Entire screen")
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--autoplay-policy=no-user-gesture-required")
     options.binary_location = "/opt/chrome-linux64/chrome"
     chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
     return webdriver.Chrome(service=Service(chromedriver_path), options=options)
@@ -102,9 +105,13 @@ def run_screenshare_job(job_id, url):
         log.info(f"[{job_id}] Chrome started")
 
         driver.get(url)
-        time.sleep(2)
+        time.sleep(5)  # Give stream time to load and play
         target_tab = driver.current_window_handle
         log.info(f"[{job_id}] Target loaded: '{driver.title}'")
+
+        # Maximize window so stream fills the Xvfb display
+        driver.maximize_window()
+        time.sleep(2)
 
         driver.execute_script("window.open('https://screensharing.net', '_blank');")
         time.sleep(2)

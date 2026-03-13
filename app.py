@@ -65,7 +65,8 @@ def make_driver():
     options.add_argument("--autoplay-policy=no-user-gesture-required")
     options.binary_location = "/opt/chrome-linux64/chrome"
     chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
-    return webdriver.Chrome(service=Service(chromedriver_path), options=options)
+    service = Service(executable_path=chromedriver_path)
+    return webdriver.Chrome(service=service, options=options)
 
 
 def get_share_link(driver):
